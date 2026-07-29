@@ -17,9 +17,16 @@ jobs:
       - uses: alexellis/arkade-get@master
         with:
           golangci-lint: latest
+
+      - name: Set up Task
+        uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Lint Go Code
         run: |
-          make lint-go
+          task lint-go
 
   build:
     name: Build
@@ -34,9 +41,15 @@ jobs:
         with:
           go-version: "^1.20.0"
 
+      - name: Set up Task
+        uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Build
         run: |
-          make build
+          task build
 
   test:
     name: Test
@@ -50,9 +63,15 @@ jobs:
         with:
           go-version: "^1.20.0"
 
+      - name: Set up Task
+        uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Run Unit tests.
         run: |
-          make test
+          task test
 
   e2e:
     name: E2E
@@ -76,8 +95,14 @@ jobs:
         with:
           go-version: "^1.20.0"
 
+      - name: Set up Task
+        uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Run Redis E2E tests.
         env:
           GOSMEE_REDIS_TEST_URL: redis://localhost:6379/0
         run: |
-          make test-e2e
+          task test-e2e

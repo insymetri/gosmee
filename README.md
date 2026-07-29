@@ -117,7 +117,7 @@ go install -v github.com/chmouel/gosmee@latest
 Clone the repository and use:
 
 ```shell
--$ make build
+-$ go-task build
 -$ ./bin/gosmee --help
 ```
 
@@ -494,21 +494,21 @@ For a full security reference — including webhook signature validation, IP res
 Run the default unit test suite without external services:
 
 ```shell
-make test
+go-task test
 ```
 
 Run Redis Streams e2e tests with Docker:
 
 ```shell
-make test-e2e
+go-task test-e2e
 ```
 
-`make test-e2e` starts a temporary `redis:7-alpine` container when no Redis URL is configured, runs the real `gosmee` binaries against it, and removes the container afterward.
+`go-task test-e2e` starts a temporary `redis:7-alpine` container when no Redis URL is configured, runs the real `gosmee` binaries against it, and removes the container afterward.
 
 To use an existing Redis instance instead:
 
 ```shell
-GOSMEE_REDIS_TEST_URL=redis://localhost:6379/0 make test-e2e
+GOSMEE_REDIS_TEST_URL=redis://localhost:6379/0 go-task test-e2e
 ```
 
 Redis e2e tests are opt-in for local development and run in GitHub Actions for every push and pull request.
