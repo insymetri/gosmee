@@ -17,21 +17,21 @@ repos:
   hooks:
   - id: lint-markdown
     name: "Lint Markdown"
-    entry: make
+    entry: go-task
     args: ["lint-md"]
     language: system
     types: [markdown]
     pass_filenames: false
   - id: lint-go
     name: "Lint GO"
-    entry: make
+    entry: go-task
     args: ["lint-go"]
     language: system
     types: [go]
     pass_filenames: false
   - id: test
     name: "Unit testing"
-    entry: make
+    entry: go-task
     args: ["test"]
     language: system
     types: [go]

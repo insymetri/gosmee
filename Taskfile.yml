@@ -1,0 +1,151 @@
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+version: "3"
+
+silent: true
+
+vars:
+  NAME: gosmee
+  OUTPUT_DIR: bin
+  LDFLAGS: -s -w
+  FLAGS: -ldflags "{{.LDFLAGS}}" -buildvcs=true
+  TEST_FLAGS: -v
+  COVERAGE_FLAGS: -covermode=atomic
+
+tasks:
+  default:
+    desc: Run tests, linters and build
+    aliases: [all]
+    cmds:
+      - task: test
+      - task: lint
+      - task: build
+
+  check:
+    desc: Format, lint and test
+    cmds:
+      - task: fmt
+      - task: lint
+      - task: test
+
+  vendor:
+    desc: Regenerate the vendor directory
+    cmds:
+      - echo Generating vendor directory
+      - go mod tidy
+      - go mod vendor
+
+  build:
+    desc: Build the binary into {{.OUTPUT_DIR}}/
+    deps: [clean]
+    cmds:
+      - echo "building."
+      - mkdir -p {{.OUTPUT_DIR}}
+      - go build {{.FLAGS}} -o {{.OUTPUT_DIR}}/{{.NAME}} main.go
+
+  build-vendor:
+    desc: Build the binary from the vendor directory
+    cmds:
+      - mkdir -p {{.OUTPUT_DIR}}
+      - go build -mod=vendor {{.FLAGS}} -o {{.OUTPUT_DIR}}/{{.NAME}} ./main.go
+
+  build-aarch64-linux:
+    desc: Cross-build the binary for linux/arm64
+    env:
+      GOARCH: arm64
+      GOOS: linux
+    cmds:
+      - mkdir -p {{.OUTPUT_DIR}}
+      - go build -mod=vendor {{.FLAGS}} -o {{.OUTPUT_DIR}}/{{.NAME}}-aarch64-linux ./main.go
+
+  clean:
+    desc: Remove the built binary
+    cmds:
+      - rm -rf {{.OUTPUT_DIR}}/{{.NAME}}
+
+  test:
+    desc: Run the unit tests
+    cmds:
+      - go test {{.TEST_FLAGS}} ./...
+
+  test-e2e:
+    desc: Run the Redis e2e tests, starting a throwaway Redis container when needed
+    cmds:
+      # Runs under bash rather than the built-in interpreter: the container
+      # cleanup relies on trap INT/TERM, which the built-in one rejects.
+      - |
+        bash <<'SCRIPT'
+        if [ -n "$GOSMEE_E2E_REDIS_URL" ] && [ -z "$GOSMEE_REDIS_TEST_URL" ]; then
+        	export GOSMEE_REDIS_TEST_URL="$GOSMEE_E2E_REDIS_URL"
+        fi
+        if [ -n "$GOSMEE_REDIS_TEST_URL" ]; then
+        	echo "Running Redis e2e tests with $GOSMEE_REDIS_TEST_URL"
+        	go test -tags=e2e {{.TEST_FLAGS}} -count=1 ./e2e && go test {{.TEST_FLAGS}} -count=1 ./gosmee -run TestRedisStreamsIntegration
+        else
+        	command -v docker >/dev/null || { echo "docker is required for task test-e2e when GOSMEE_REDIS_TEST_URL is unset" >&2; exit 1; }
+        	docker info >/dev/null 2>&1 || { echo "docker daemon is not available; set GOSMEE_REDIS_TEST_URL to use an existing Redis" >&2; exit 1; }
+        	container_id=$(docker run -d -p 127.0.0.1::6379 redis:7-alpine) || { echo "failed to start redis:7-alpine container" >&2; exit 1; }
+        	trap 'docker rm -f "$container_id" >/dev/null 2>&1 || true' EXIT INT TERM
+        	redis_port=""
+        	for _ in $(seq 1 60); do
+        		if docker exec "$container_id" redis-cli ping >/dev/null 2>&1; then
+        			redis_port=$(docker port "$container_id" 6379/tcp | sed 's/.*://')
+        			break
+        		fi
+        		sleep 1
+        	done
+        	if [ -z "$redis_port" ]; then
+        		echo "Redis container did not become ready" >&2
+        		exit 1
+        	fi
+        	export GOSMEE_REDIS_TEST_URL="redis://localhost:$redis_port/0"
+        	echo "Running Redis e2e tests with $GOSMEE_REDIS_TEST_URL"
+        	go test -tags=e2e {{.TEST_FLAGS}} -count=1 ./e2e && go test {{.TEST_FLAGS}} -count=1 ./gosmee -run TestRedisStreamsIntegration
+        fi
+        SCRIPT
+
+  html-coverage:
+    desc: Generate and open an HTML coverage report
+    cmds:
+      - mkdir -p tmp
+      - go test {{.COVERAGE_FLAGS}} -coverprofile=tmp/c.out ./...
+      - go tool cover -html=tmp/c.out
+
+  lint:
+    desc: Run every linter
+    cmds:
+      - task: lint-go
+      - task: lint-md
+
+  lint-go:
+    desc: Lint the Go code with golangci-lint
+    cmds:
+      - echo "linting."
+      - golangci-lint version
+      - golangci-lint run ./... --modules-download-mode=vendor
+
+  lint-md:
+    desc: Run markdownlint and vale on all markdown files
+    vars:
+      MD_FILES:
+        sh: find . -type f -regex ".*md" -not -regex '^./vendor/.*' -not -regex '^./.vale/.*' -not -regex "^./.git/.*" -print
+    cmds:
+      - echo "Linting markdown files..."
+      - markdownlint {{.MD_FILES | catLines}}
+      - echo "Grammar check with vale of documentation..."
+      - vale docs/content --minAlertLevel=error --output=line
+
+  dev-server:
+    desc: Run the server, reloading on template and Go changes
+    cmds:
+      - |
+        reflex -r '.*\.(tmpl|go)' -s go run main.go -- server --footer "Contact: <a href=\"https://twitter.com/me\">Me</a> - use it at your own risk"
+
+  fmt:
+    desc: Format the Go code with go fmt
+    cmds:
+      - go fmt $(go list ./... | grep -v /vendor/)
+
+  fumpt:
+    desc: Format the Go code with gofumpt
+    cmds:
+      - gofumpt -e -w -extra ./
