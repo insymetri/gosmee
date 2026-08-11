@@ -44,6 +44,67 @@ func TestIsValidChannelID(t *testing.T) {
 	}
 }
 
+func TestForEachChannelAncestor(t *testing.T) {
+	collect := func(channel string) []string {
+		var seen []string
+		forEachChannelAncestor(channel, func(prefix string) bool {
+			seen = append(seen, prefix)
+			return true
+		})
+		return seen
+	}
+
+	assert.DeepEqual(t, collect("a/b/c"), []string{"a/b/c", "a/b", "a", ""})
+	assert.DeepEqual(t, collect("a"), []string{"a", ""})
+	assert.DeepEqual(t, collect(""), []string{""})
+
+	t.Run("a false return stops the walk", func(t *testing.T) {
+		var seen []string
+		forEachChannelAncestor("a/b/c", func(prefix string) bool {
+			seen = append(seen, prefix)
+			return len(seen) < 2
+		})
+		assert.DeepEqual(t, seen, []string{"a/b/c", "a/b"})
+	})
+}
+
+// The prefix wire protocol is GET /events/{prefix}?prefix=1, with the root
+// subscription spelled GET /events/. Pin the routing both forms depend on.
+func TestEventsRoutePrefixForms(t *testing.T) {
+	reached := false
+	eventsChannel := "unset"
+	router := chi.NewRouter()
+	registerMainRoutes(router, "https://example.com", "", nil, func(_ http.ResponseWriter, r *http.Request) {
+		reached = true
+		eventsChannel = chi.URLParam(r, "*")
+	})
+
+	get := func(path string) *httptest.ResponseRecorder {
+		t.Helper()
+
+		reached = false
+		eventsChannel = "unset"
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodGet, path, nil))
+		return w
+	}
+
+	t.Run("events root reaches the events handler with an empty channel", func(t *testing.T) {
+		assert.Equal(t, get("/events/").Code, http.StatusOK)
+		assert.Assert(t, reached, "GET /events/ must reach the events handler")
+		assert.Equal(t, eventsChannel, "")
+	})
+
+	// Pre-existing quirk: without the trailing slash the catch-all serves the
+	// index for a channel called "events". Nobody should "fix" this by accident.
+	t.Run("events without a trailing slash renders the index", func(t *testing.T) {
+		w := get("/events")
+		assert.Equal(t, w.Code, http.StatusOK)
+		assert.Assert(t, !reached, "GET /events must not reach the events handler")
+		assert.Assert(t, strings.Contains(w.Body.String(), "https://example.com/events"))
+	})
+}
+
 func TestMainRouterChannelPaths(t *testing.T) {
 	eventsChannel := ""
 	router := chi.NewRouter()

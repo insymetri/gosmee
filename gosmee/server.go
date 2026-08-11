@@ -34,8 +34,13 @@ const (
 	timeFormat        = "2006-01-02T15.04.01.000"
 	contentType       = "application/json"
 	versionHeaderName = "X-Gosmee-Version"
-	minChannelLength  = 12  // Length of the ids handed out by /new
-	maxChannelLength  = 255 // Set maximum channel length to prevent DoS attacks
+	// The server sets this header when it honored a subtree (prefix)
+	// subscription. An older server ignores ?prefix=1, so the client uses this
+	// header to tell an honored subscription from a silently exact one.
+	subscriptionHeaderName  = "X-Gosmee-Subscription"
+	subscriptionPrefixValue = "prefix"
+	minChannelLength        = 12  // Length of the ids handed out by /new
+	maxChannelLength        = 255 // Set maximum channel length to prevent DoS attacks
 	// A channel id is one or more slash separated segments, so it can mirror a
 	// real webhook path such as "github/myorg/myrepo/push".
 	channelIDPattern = "[a-zA-Z0-9_-]+(?:/[a-zA-Z0-9_-]+)*"
@@ -62,7 +67,10 @@ var faviconSVG []byte
 
 // Subscriber represents a client connection listening for events.
 type Subscriber struct {
+	// Channel is the exact channel for a normal subscriber, or the subscribed
+	// prefix for a subtree subscriber.
 	Channel   string
+	Prefix    bool
 	Events    chan relayEvent
 	PublicKey *[32]byte
 }
@@ -70,8 +78,9 @@ type Subscriber struct {
 // EventBroker manages event subscriptions and publications.
 type EventBroker struct {
 	sync.RWMutex
-	subscribers map[string][]*Subscriber
-	logger      *slog.Logger
+	subscribers       map[string][]*Subscriber // exact channel -> subscribers
+	prefixSubscribers map[string][]*Subscriber // prefix -> subtree subscribers
+	logger            *slog.Logger
 }
 
 // NewEventBroker creates a new event broker.
@@ -81,8 +90,9 @@ func NewEventBroker(loggers ...*slog.Logger) *EventBroker {
 		logger = loggers[0]
 	}
 	return &EventBroker{
-		subscribers: make(map[string][]*Subscriber),
-		logger:      logger,
+		subscribers:       make(map[string][]*Subscriber),
+		prefixSubscribers: make(map[string][]*Subscriber),
+		logger:            logger,
 	}
 }
 
@@ -101,23 +111,46 @@ func (eb *EventBroker) Subscribe(channel string, pubKey *[32]byte) *Subscriber {
 	return subscriber
 }
 
-// Unsubscribe removes a subscriber from a channel.
+// SubscribePrefix adds a subscriber for every channel at or below prefix. The
+// empty prefix subscribes to the whole server.
+func (eb *EventBroker) SubscribePrefix(prefix string, pubKey *[32]byte) *Subscriber {
+	eb.Lock()
+	defer eb.Unlock()
+
+	subscriber := &Subscriber{
+		Channel:   prefix,
+		Prefix:    true,
+		Events:    make(chan relayEvent, 100), // Buffer size to prevent blocking
+		PublicKey: pubKey,
+	}
+
+	eb.prefixSubscribers[prefix] = append(eb.prefixSubscribers[prefix], subscriber)
+	return subscriber
+}
+
+// Unsubscribe removes a subscriber from a channel or, for a subtree
+// subscriber, from its prefix.
 func (eb *EventBroker) Unsubscribe(channel string, subscriber *Subscriber) {
 	eb.Lock()
 	defer eb.Unlock()
 
-	subscribers := eb.subscribers[channel]
+	registry := eb.subscribers
+	if subscriber != nil && subscriber.Prefix {
+		registry = eb.prefixSubscribers
+	}
+
+	subscribers := registry[channel]
 	for i, s := range subscribers {
 		if s == subscriber {
 			// Remove subscriber from slice
-			eb.subscribers[channel] = slices.Delete(subscribers, i, i+1)
+			registry[channel] = slices.Delete(subscribers, i, i+1)
 			close(subscriber.Events)
 			break
 		}
 	}
 
-	if len(eb.subscribers[channel]) == 0 {
-		delete(eb.subscribers, channel)
+	if len(registry[channel]) == 0 {
+		delete(registry, channel)
 	}
 }
 
@@ -130,6 +163,15 @@ func (eb *EventBroker) Publish(channel string, data []byte) {
 func (eb *EventBroker) PublishEvent(channel string, event relayEvent) {
 	eb.RLock()
 	subscribers := append([]*Subscriber(nil), eb.subscribers[channel]...)
+	// A subtree subscriber is registered under one of the channel's ancestors,
+	// so walk the ancestors instead of scanning every prefix. A subscriber
+	// lives in exactly one map under one key, so no dedup is needed.
+	if len(eb.prefixSubscribers) > 0 {
+		forEachChannelAncestor(channel, func(prefix string) bool {
+			subscribers = append(subscribers, eb.prefixSubscribers[prefix]...)
+			return true
+		})
+	}
 	eb.RUnlock()
 	if event.DeliveryID == "" {
 		event.DeliveryID, event.EventType = relayEventMetadata(event.Data)
@@ -151,12 +193,14 @@ func (eb *EventBroker) PublishEvent(channel string, event relayEvent) {
 		select {
 		case s.Events <- payload:
 			eb.logger.LogAttrs(context.Background(), slog.LevelDebug, "event queued for subscriber",
-				slog.String("channel", channel), slog.String("delivery_id", payload.DeliveryID),
+				slog.String("channel", channel), slog.String("subscriber_channel", s.Channel),
+				slog.String("delivery_id", payload.DeliveryID),
 				slog.String("stream_id", payload.ID), slog.String("event_type", payload.EventType),
 				slog.Int("queue_depth", len(s.Events)))
 		default:
 			eb.logger.LogAttrs(context.Background(), slog.LevelWarn, "event dropped for subscriber: buffer full",
-				slog.String("channel", channel), slog.String("delivery_id", payload.DeliveryID),
+				slog.String("channel", channel), slog.String("subscriber_channel", s.Channel),
+				slog.String("delivery_id", payload.DeliveryID),
 				slog.String("stream_id", payload.ID), slog.String("event_type", payload.EventType),
 				slog.Int("queue_depth", len(s.Events)))
 		}
@@ -167,17 +211,45 @@ func rejectProtectedChannelRequest(w http.ResponseWriter) {
 	http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 }
 
-func nextPlaintextChannel(protectedChannels *ProtectedChannels) string {
-	for {
+// nextPlaintextChannel returns a random channel id that no protected entry
+// covers. A "*" entry covers every id, so it reports false at once instead of
+// looping forever.
+func nextPlaintextChannel(protectedChannels *ProtectedChannels) (string, bool) {
+	if protectedChannels.CoversRoot() {
+		return "", false
+	}
+
+	for range 100 {
 		channel := randomString(minChannelLength)
-		if !protectedChannels.Has(channel) {
-			return channel
+		if !protectedChannels.Covers(channel) {
+			return channel, true
 		}
 	}
+	return "", false
 }
 
 func isValidChannelID(channel string) bool {
 	return len(channel) <= maxChannelLength && validChannelID.MatchString(channel)
+}
+
+// forEachChannelAncestor calls fn with channel and each ancestor prefix, most
+// specific first, ending with the root prefix "". "a/b" yields "a/b", "a", "".
+// Returns early when fn returns false.
+func forEachChannelAncestor(channel string, fn func(prefix string) bool) {
+	for {
+		if !fn(channel) {
+			return
+		}
+		if channel == "" {
+			return
+		}
+		index := strings.LastIndex(channel, "/")
+		if index < 0 {
+			channel = ""
+			continue
+		}
+		channel = channel[:index]
+	}
 }
 
 // requestChannel returns the channel id matched by a catch-all route and
@@ -206,7 +278,12 @@ func effectivePublicURL(publicURL, portAddr string, sslEnabled bool) string {
 
 func showNewURL(publicURL string, protectedChannels *ProtectedChannels) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
-		url := fmt.Sprintf("%s/%s", publicURL, nextPlaintextChannel(protectedChannels))
+		channel, ok := nextPlaintextChannel(protectedChannels)
+		if !ok {
+			http.Error(w, "no public channel is available on this server", http.StatusNotFound)
+			return
+		}
+		url := fmt.Sprintf("%s/%s", publicURL, channel)
 		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w, "%s\n", url)
@@ -217,14 +294,19 @@ func serveIndex(publicURL, footer string, protectedChannels *ProtectedChannels) 
 	return func(w http.ResponseWriter, r *http.Request) {
 		channel, valid := requestChannel(r)
 		if channel == "" {
-			http.Redirect(w, r, fmt.Sprintf("%s/%s", publicURL, nextPlaintextChannel(protectedChannels)), http.StatusFound)
+			generated, ok := nextPlaintextChannel(protectedChannels)
+			if !ok {
+				http.Error(w, "no public channel is available on this server", http.StatusNotFound)
+				return
+			}
+			http.Redirect(w, r, fmt.Sprintf("%s/%s", publicURL, generated), http.StatusFound)
 			return
 		}
 		if !valid {
 			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 			return
 		}
-		if protectedChannels.Has(channel) {
+		if protectedChannels.Covers(channel) {
 			rejectProtectedChannelRequest(w)
 			return
 		}
@@ -412,6 +494,8 @@ func handleWebhookPost(c *cli.Context, relay payloadRelay, webhookSecrets []stri
 		}
 		payload["timestamp"] = fmt.Sprintf("%d", now.UnixMilli())
 		payload["bodyB"] = base64.StdEncoding.EncodeToString(body)
+		// After the header copy, so a spoofed X-Gosmee-Channel cannot win.
+		payload["x-gosmee-channel"] = channel
 		reencoded, err := json.Marshal(payload)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -503,6 +587,8 @@ func handleReplayPost(c *cli.Context, relay payloadRelay) http.HandlerFunc {
 		payload["timestamp"] = fmt.Sprintf("%d", now.UnixMilli())
 		payload["bodyB"] = base64.StdEncoding.EncodeToString(body)
 		payload["content-type"] = contentType // Ensure content-type is set for replay
+		// After the header copy, so a spoofed X-Gosmee-Channel cannot win.
+		payload["x-gosmee-channel"] = channel
 
 		// Re-encode the payload to match the expected format
 		reencoded, err := json.Marshal(payload)
@@ -660,30 +746,123 @@ func retVersion(w http.ResponseWriter, _ *http.Request) {
 	}
 }
 
-func authorizeEventSubscriber(w http.ResponseWriter, r *http.Request, protectedChannels *ProtectedChannels) (string, *[32]byte, bool) {
+// eventSubscription is what a subscribe request resolved to once authorized.
+type eventSubscription struct {
+	// Channel is the exact channel, or the subscribed prefix in prefix mode.
+	Channel string
+	Prefix  bool
+	PubKey  *[32]byte
+}
+
+// requestChannelPrefix returns the prefix matched by a catch-all route and
+// whether it is valid. Unlike requestChannel, the empty prefix is valid: it is
+// the whole server.
+func requestChannelPrefix(r *http.Request) (string, bool) {
+	prefix := chi.URLParam(r, "*")
+	if prefix == "" {
+		return "", true
+	}
+	return prefix, isValidChannelID(prefix)
+}
+
+// requestPrefixMode reports whether the request asked for a subtree
+// subscription. The second result is false when the value is not a boolean,
+// which must be an error rather than a silent false.
+func requestPrefixMode(r *http.Request) (bool, bool) {
+	query := r.URL.Query()
+	if !query.Has("prefix") {
+		return false, true
+	}
+	prefixMode, err := strconv.ParseBool(query.Get("prefix"))
+	if err != nil {
+		return false, false
+	}
+	return prefixMode, true
+}
+
+// authorizePrefixSubscription decides whether a subtree subscription on prefix
+// is allowed, and returns the key its events must be encrypted with.
+func authorizePrefixSubscription(protectedChannels *ProtectedChannels, prefix string, pubKey *[32]byte, allowOpenRoot bool) (*[32]byte, bool) {
+	if prefix == "" && !protectedChannels.CoversRoot() && !allowOpenRoot {
+		return nil, false
+	}
+
+	covered := protectedChannels.Covers(prefix)
+	if !covered && !protectedChannels.HasProtectedDescendant(prefix) {
+		// Nothing in this subtree is protected, so this matches what an
+		// unprotected exact channel does today: plaintext, no key needed.
+		return nil, true
+	}
+
+	if pubKey == nil {
+		return nil, false
+	}
+	if covered && !protectedChannels.IsAllowed(prefix, pubKey) {
+		return nil, false
+	}
+	// A subtree subscriber observes every channel below prefix, so it must be
+	// authorized on all of them. Refuse outright rather than filter silently.
+	if !protectedChannels.AllowsSubtree(prefix, pubKey) {
+		return nil, false
+	}
+	return pubKey, true
+}
+
+func authorizeEventSubscriber(w http.ResponseWriter, r *http.Request, protectedChannels *ProtectedChannels, allowOpenRoot bool) (eventSubscription, bool) {
+	prefixMode, ok := requestPrefixMode(r)
+	if !ok {
+		http.Error(w, "invalid prefix parameter", http.StatusBadRequest)
+		return eventSubscription{}, false
+	}
+
+	if prefixMode {
+		prefix, valid := requestChannelPrefix(r)
+		if !valid {
+			rejectInvalidChannelRequest(w)
+			return eventSubscription{}, false
+		}
+
+		var pubKey *[32]byte
+		if pubKeyValue := r.URL.Query().Get("pubkey"); pubKeyValue != "" {
+			var err error
+			pubKey, err = ParsePublicKey(pubKeyValue)
+			if err != nil {
+				rejectProtectedChannelRequest(w)
+				return eventSubscription{}, false
+			}
+		}
+
+		authorizedKey, ok := authorizePrefixSubscription(protectedChannels, prefix, pubKey, allowOpenRoot)
+		if !ok {
+			rejectProtectedChannelRequest(w)
+			return eventSubscription{}, false
+		}
+		return eventSubscription{Channel: prefix, Prefix: true, PubKey: authorizedKey}, true
+	}
+
 	channel, valid := requestChannel(r)
 	if !valid {
 		rejectInvalidChannelRequest(w)
-		return "", nil, false
+		return eventSubscription{}, false
 	}
 
 	var pubKey *[32]byte
-	if protectedChannels.Has(channel) {
+	if protectedChannels.Covers(channel) {
 		pubKeyValue := r.URL.Query().Get("pubkey")
 		if pubKeyValue == "" {
 			rejectProtectedChannelRequest(w)
-			return "", nil, false
+			return eventSubscription{}, false
 		}
 
 		var err error
 		pubKey, err = ParsePublicKey(pubKeyValue)
 		if err != nil || !protectedChannels.IsAllowed(channel, pubKey) {
 			rejectProtectedChannelRequest(w)
-			return "", nil, false
+			return eventSubscription{}, false
 		}
 	}
 
-	return channel, pubKey, true
+	return eventSubscription{Channel: channel, PubKey: pubKey}, true
 }
 
 func setupSSEHeaders(w http.ResponseWriter, corsOrigin string) {
@@ -782,22 +961,33 @@ func compareRedisStreamIDs(a, b string) (int, error) {
 	return 0, nil
 }
 
-func handleEventsGet(eventBroker *EventBroker, protectedChannels *ProtectedChannels, corsOrigin string) http.HandlerFunc {
+func handleEventsGet(eventBroker *EventBroker, protectedChannels *ProtectedChannels, corsOrigin string, allowOpenRoot bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if _, ok := w.(http.Flusher); !ok {
 			http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
 			return
 		}
-		channel, pubKey, ok := authorizeEventSubscriber(w, r, protectedChannels)
+		sub, ok := authorizeEventSubscriber(w, r, protectedChannels, allowOpenRoot)
 		if !ok {
 			return
 		}
+		channel := sub.Channel
 
-		subscriber := eventBroker.Subscribe(channel, pubKey)
+		var subscriber *Subscriber
+		if sub.Prefix {
+			subscriber = eventBroker.SubscribePrefix(channel, sub.PubKey)
+		} else {
+			subscriber = eventBroker.Subscribe(channel, sub.PubKey)
+		}
 		defer eventBroker.Unsubscribe(channel, subscriber)
 
 		reqID := middleware.GetReqID(r.Context())
 
+		// Tells the client the subtree subscription was honored. Without it a
+		// client cannot tell this server from one too old to know --prefix.
+		if sub.Prefix {
+			w.Header().Set(subscriptionHeaderName, subscriptionPrefixValue)
+		}
 		setupSSEHeaders(w, corsOrigin)
 
 		if err := writeSSEEvent(w, "", "", []byte(`{"message":"connected"}`)); err != nil {
@@ -850,7 +1040,7 @@ func handleEventsGet(eventBroker *EventBroker, protectedChannels *ProtectedChann
 	}
 }
 
-func handleRedisEventsGet(redisRelay *redisPayloadRelay, protectedChannels *ProtectedChannels, corsOrigin string, loggers ...*slog.Logger) http.HandlerFunc {
+func handleRedisEventsGet(redisRelay *redisPayloadRelay, protectedChannels *ProtectedChannels, corsOrigin string, allowOpenRoot bool, loggers ...*slog.Logger) http.HandlerFunc {
 	logger := slog.Default()
 	if len(loggers) > 0 && loggers[0] != nil {
 		logger = loggers[0]
@@ -860,10 +1050,18 @@ func handleRedisEventsGet(redisRelay *redisPayloadRelay, protectedChannels *Prot
 			http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
 			return
 		}
-		channel, pubKey, ok := authorizeEventSubscriber(w, r, protectedChannels)
+		// Subtree delivery is in-memory only: a Redis subscriber reads one
+		// stream key, and fanning out across keys would break Last-Event-ID
+		// resume.
+		if prefixMode, ok := requestPrefixMode(r); !ok || prefixMode {
+			http.Error(w, "subtree (prefix) subscriptions are not supported when the server runs with --redis-url", http.StatusBadRequest)
+			return
+		}
+		sub, ok := authorizeEventSubscriber(w, r, protectedChannels, allowOpenRoot)
 		if !ok {
 			return
 		}
+		channel, pubKey := sub.Channel, sub.PubKey
 
 		lastEventID := r.Header.Get("Last-Event-ID")
 		readAfterID := ""
@@ -1062,10 +1260,11 @@ func serve(c *cli.Context) error {
 
 	// SSE endpoint for event streaming
 	var eventsHandler http.HandlerFunc
+	allowOpenRoot := c.Bool("allow-open-root-subscription")
 	if redisRelay != nil {
-		eventsHandler = handleRedisEventsGet(redisRelay, protectedChannels, corsOrigin, logger)
+		eventsHandler = handleRedisEventsGet(redisRelay, protectedChannels, corsOrigin, allowOpenRoot, logger)
 	} else {
-		eventsHandler = handleEventsGet(eventBroker, protectedChannels, corsOrigin)
+		eventsHandler = handleEventsGet(eventBroker, protectedChannels, corsOrigin, allowOpenRoot)
 	}
 	registerMainRoutes(mainRouter, publicURL, footer, protectedChannels, eventsHandler)
 

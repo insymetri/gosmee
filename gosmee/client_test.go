@@ -8,6 +8,7 @@ import (
 	"log/slog" // For http.MethodPost, etc.
 	"net/http" // For httptest.NewServer
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1484,11 +1485,12 @@ func TestClientSetupKeyFileWithSmeeIOFails(t *testing.T) {
 
 func TestPrepareSubscription(t *testing.T) {
 	t.Run("plaintext gosmee server does not require a key file", func(t *testing.T) {
-		channel, sseURL, privateKey, err := prepareSubscription("https://example.com/plainchannel", "")
+		sub, err := prepareSubscription("https://example.com/plainchannel", "", false)
 		assert.NilError(t, err)
-		assert.Equal(t, channel, "plainchannel")
-		assert.Equal(t, sseURL, "https://example.com/events/plainchannel")
-		assert.Assert(t, privateKey == nil)
+		assert.Equal(t, sub.Channel, "plainchannel")
+		assert.Equal(t, sub.SSEURL, "https://example.com/events/plainchannel")
+		assert.Assert(t, !sub.Prefix)
+		assert.Assert(t, sub.PrivateKey == nil)
 	})
 
 	t.Run("protected gosmee server appends public key", func(t *testing.T) {
@@ -1497,32 +1499,84 @@ func TestPrepareSubscription(t *testing.T) {
 		assert.NilError(t, err)
 		assert.NilError(t, SaveKeyPair(keyPath, publicKey, privateKey))
 
-		channel, sseURL, loadedPrivateKey, err := prepareSubscription("https://example.com/protectedchan", keyPath)
+		sub, err := prepareSubscription("https://example.com/protectedchan", keyPath, false)
 		assert.NilError(t, err)
-		assert.Equal(t, channel, "protectedchan")
-		assert.Assert(t, strings.HasPrefix(sseURL, "https://example.com/events/protectedchan?pubkey="))
-		assert.DeepEqual(t, loadedPrivateKey, privateKey)
+		assert.Equal(t, sub.Channel, "protectedchan")
+		assert.Assert(t, strings.HasPrefix(sub.SSEURL, "https://example.com/events/protectedchan?pubkey="))
+		assert.DeepEqual(t, sub.PrivateKey, privateKey)
 	})
 
 	t.Run("multi segment channel keeps every path segment", func(t *testing.T) {
-		channel, sseURL, privateKey, err := prepareSubscription("https://example.com/github/myorg/myrepo/push", "")
+		sub, err := prepareSubscription("https://example.com/github/myorg/myrepo/push", "", false)
 		assert.NilError(t, err)
-		assert.Equal(t, channel, "github/myorg/myrepo/push")
-		assert.Equal(t, sseURL, "https://example.com/events/github/myorg/myrepo/push")
-		assert.Assert(t, privateKey == nil)
+		assert.Equal(t, sub.Channel, "github/myorg/myrepo/push")
+		assert.Equal(t, sub.SSEURL, "https://example.com/events/github/myorg/myrepo/push")
+		assert.Assert(t, sub.PrivateKey == nil)
 	})
 
 	t.Run("trailing slash is trimmed", func(t *testing.T) {
-		channel, sseURL, _, err := prepareSubscription("https://example.com/plainchannel/", "")
+		sub, err := prepareSubscription("https://example.com/plainchannel/", "", false)
 		assert.NilError(t, err)
-		assert.Equal(t, channel, "plainchannel")
-		assert.Equal(t, sseURL, "https://example.com/events/plainchannel")
+		assert.Equal(t, sub.Channel, "plainchannel")
+		assert.Equal(t, sub.SSEURL, "https://example.com/events/plainchannel")
 	})
 
 	t.Run("url without a channel is rejected", func(t *testing.T) {
-		_, _, _, err := prepareSubscription("https://example.com", "")
+		_, err := prepareSubscription("https://example.com", "", false)
 		assert.ErrorContains(t, err, "no channel in smee url")
 	})
+
+	t.Run("root url in prefix mode subscribes to the whole server", func(t *testing.T) {
+		sub, err := prepareSubscription("https://example.com", "", true)
+		assert.NilError(t, err)
+		assert.Equal(t, sub.Channel, "")
+		assert.Assert(t, sub.Prefix)
+		assert.Equal(t, sub.SSEURL, "https://example.com/events/?prefix=1")
+	})
+
+	t.Run("prefix mode keeps the prefix in the path", func(t *testing.T) {
+		sub, err := prepareSubscription("https://example.com/team", "", true)
+		assert.NilError(t, err)
+		assert.Equal(t, sub.Channel, "team")
+		assert.Assert(t, sub.Prefix)
+		assert.Equal(t, sub.SSEURL, "https://example.com/events/team?prefix=1")
+	})
+
+	t.Run("prefix mode with a key file sends both query params", func(t *testing.T) {
+		keyPath := filepath.Join(t.TempDir(), "client-key.json")
+		publicKey, privateKey, err := GenerateKeyPair()
+		assert.NilError(t, err)
+		assert.NilError(t, SaveKeyPair(keyPath, publicKey, privateKey))
+
+		sub, err := prepareSubscription("https://example.com/team", keyPath, true)
+		assert.NilError(t, err)
+		assert.DeepEqual(t, sub.PrivateKey, privateKey)
+
+		parsed, err := url.Parse(sub.SSEURL)
+		assert.NilError(t, err)
+		assert.Equal(t, parsed.Path, "/events/team")
+		assert.Equal(t, parsed.Query().Get("prefix"), "1")
+		assert.Equal(t, parsed.Query().Get("pubkey"), EncodePublicKey(publicKey))
+	})
+
+	t.Run("invalid prefix is rejected client side", func(t *testing.T) {
+		_, err := prepareSubscription("https://example.com/has.dot", "", true)
+		assert.ErrorContains(t, err, "must match")
+	})
+
+	t.Run("smee.io does not support prefix mode", func(t *testing.T) {
+		_, err := prepareSubscription("https://smee.io/abcdef", "", true)
+		assert.ErrorContains(t, err, "smee.io")
+	})
+}
+
+func TestClientPrefixMode(t *testing.T) {
+	assert.Assert(t, clientPrefixMode(false, "https://srv"))
+	assert.Assert(t, clientPrefixMode(false, "https://srv/"))
+	assert.Assert(t, !clientPrefixMode(false, "https://srv/abc"))
+	assert.Assert(t, clientPrefixMode(true, "https://srv/abc"))
+	// A URL that cannot be parsed is left to prepareSubscription to report.
+	assert.Assert(t, !clientPrefixMode(false, "://nope"))
 }
 
 func TestIsOlderVersion(t *testing.T) {
@@ -1783,4 +1837,168 @@ func TestRunExecCommand(t *testing.T) {
 		_, err = os.Stat(tmpFile)
 		assert.NilError(t, err, "file should exist because 'push' is in exec-on-events list")
 	})
+}
+
+func TestParseChannel(t *testing.T) {
+	p := goSmee{
+		replayDataOpts: &replayDataOpts{},
+		logger:         slog.New(slog.DiscardHandler),
+	}
+
+	t.Run("channel is parsed and kept as a header", func(t *testing.T) {
+		payload := `{"x-gosmee-channel": "team/github/push", "content-type": "application/json", "body": {"hello": "world"}}`
+		m, err := p.parse(time.Now().UTC(), []byte(payload))
+		assert.NilError(t, err)
+		assert.Equal(t, m.channel, "team/github/push")
+		assert.Equal(t, m.headers["X-Gosmee-Channel"], "team/github/push")
+	})
+
+	t.Run("absent channel stays empty", func(t *testing.T) {
+		m, err := p.parse(time.Now().UTC(), []byte(simpleJSON))
+		assert.NilError(t, err)
+		assert.Equal(t, m.channel, "")
+	})
+}
+
+func TestChannelSuffix(t *testing.T) {
+	for _, tc := range []struct {
+		prefix, channel, want string
+		wantErr               bool
+	}{
+		{prefix: "", channel: "a/b", want: "a/b"},
+		{prefix: "", channel: "a", want: "a"},
+		{prefix: "a", channel: "a", want: ""},
+		{prefix: "a", channel: "a/b/c", want: "b/c"},
+		{prefix: "a/b", channel: "a/b/c", want: "c"},
+		{prefix: "a", channel: "ab", wantErr: true},
+		{prefix: "a", channel: "b", wantErr: true},
+		{prefix: "a/b", channel: "a", wantErr: true},
+	} {
+		got, err := channelSuffix(tc.prefix, tc.channel)
+		if tc.wantErr {
+			assert.Assert(t, err != nil, "channelSuffix(%q, %q) should fail", tc.prefix, tc.channel)
+			continue
+		}
+		assert.NilError(t, err)
+		assert.Equal(t, got, tc.want, "channelSuffix(%q, %q)", tc.prefix, tc.channel)
+	}
+}
+
+func TestTargetURLForSuffix(t *testing.T) {
+	for _, tc := range []struct {
+		base, suffix, want string
+	}{
+		{base: "http://localhost:8080", suffix: "", want: "http://localhost:8080"},
+		{base: "", suffix: "github/push", want: ""},
+		{base: "http://localhost:8080", suffix: "github/push", want: "http://localhost:8080/github/push"},
+		{base: "http://localhost:8080/", suffix: "github/push", want: "http://localhost:8080/github/push"},
+		{base: "http://localhost:8080/api", suffix: "github/push", want: "http://localhost:8080/api/github/push"},
+		{base: "http://localhost:8080/api/", suffix: "github/push", want: "http://localhost:8080/api/github/push"},
+		{base: "http://localhost:8080/api?token=x", suffix: "github/push", want: "http://localhost:8080/api/github/push?token=x"},
+		{base: "http://localhost:8080#frag", suffix: "a", want: "http://localhost:8080/a#frag"},
+	} {
+		got, err := targetURLForSuffix(tc.base, tc.suffix)
+		assert.NilError(t, err)
+		assert.Equal(t, got, tc.want, "targetURLForSuffix(%q, %q)", tc.base, tc.suffix)
+	}
+}
+
+func prefixEventJSON(channel string) []byte {
+	return []byte(fmt.Sprintf(`{
+		"x-gosmee-channel": %q,
+		"content-type": "application/json",
+		"x-github-event": "push",
+		"body": {"hello": "world"}
+	}`, channel))
+}
+
+func TestProcessClientEventPrefixTargetRewrite(t *testing.T) {
+	for _, tc := range []struct {
+		name, prefix, channel, basePath, wantPath string
+	}{
+		{name: "descendant channel", prefix: "team", channel: "team/github/push", wantPath: "/github/push"},
+		{name: "prefix itself", prefix: "team", channel: "team", wantPath: "/"},
+		{name: "base path is kept", prefix: "team", channel: "team/github/push", basePath: "/api", wantPath: "/api/github/push"},
+		{name: "root prefix", prefix: "", channel: "team/github/push", wantPath: "/team/github/push"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotPath string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.Path
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer server.Close()
+
+			gs := newTestGoSmeeForProcessing(&replayDataOpts{
+				targetURL:     server.URL + tc.basePath,
+				channelPrefix: tc.prefix,
+				prefixMode:    true,
+			})
+
+			processed, err := gs.processClientEvent(time.Now().UTC(), clientSSEEvent{Data: prefixEventJSON(tc.channel)}, nil)
+			assert.NilError(t, err)
+			assert.Assert(t, processed)
+			assert.Equal(t, gotPath, tc.wantPath)
+		})
+	}
+}
+
+func TestProcessClientEventRejectsUnsafeChannel(t *testing.T) {
+	for _, channel := range []string{"other/x", "team/../../etc", "team/has.dot"} {
+		t.Run(channel, func(t *testing.T) {
+			var called bool
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				called = true
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer server.Close()
+
+			gs := newTestGoSmeeForProcessing(&replayDataOpts{
+				targetURL:     server.URL,
+				channelPrefix: "team",
+				prefixMode:    true,
+			})
+
+			processed, err := gs.processClientEvent(time.Now().UTC(), clientSSEEvent{Data: prefixEventJSON(channel)}, nil)
+			assert.Assert(t, err != nil)
+			assert.Assert(t, isPermanentClientProcessingError(err))
+			assert.Assert(t, !processed)
+			assert.Assert(t, !called, "target must not be called")
+		})
+	}
+}
+
+func TestProcessClientEventWithoutPrefixIgnoresChannel(t *testing.T) {
+	var gotPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	gs := newTestGoSmeeForProcessing(&replayDataOpts{targetURL: server.URL + "/api"})
+
+	processed, err := gs.processClientEvent(time.Now().UTC(), clientSSEEvent{Data: prefixEventJSON("team/github/push")}, nil)
+	assert.NilError(t, err)
+	assert.Assert(t, processed)
+	assert.Equal(t, gotPath, "/api")
+}
+
+func TestDeliveryAttrsUsesResolvedTarget(t *testing.T) {
+	ropts := &replayDataOpts{targetURL: "http://localhost:8080", targetCnxTimeout: 5}
+
+	attrValue := func(attrs []slog.Attr, key string) string {
+		for _, attr := range attrs {
+			if attr.Key == key {
+				return attr.Value.String()
+			}
+		}
+		return ""
+	}
+
+	base := deliveryAttrs(ropts, payloadMsg{}, "", 1, 1, &targetDeliveryError{})
+	assert.Equal(t, attrValue(base, "target"), "http://localhost:8080")
+
+	resolved := deliveryAttrs(ropts, payloadMsg{}, "", 1, 1, &targetDeliveryError{target: "http://localhost:8080/github/push"})
+	assert.Equal(t, attrValue(resolved, "target"), "http://localhost:8080/github/push")
 }

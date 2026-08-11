@@ -67,6 +67,9 @@ type payloadMsg struct {
 	eventType   string
 	eventID     string
 	streamID    string
+	// channel is the server-side channel the event came from. It is empty when
+	// the server is too old to send it.
+	channel string
 }
 
 type clientSSEEvent struct {
@@ -148,6 +151,13 @@ func (c goSmee) parse(now time.Time, data []byte) (payloadMsg, error) {
 				if pm.eventID == "" {
 					pm.eventID = pv
 				}
+			}
+		case "x-gosmee-channel":
+			if pv, ok := payloadValue.(string); ok {
+				pm.channel = pv
+				// Keep the header the default branch used to add, which is also
+				// how an old client degrades against a new server.
+				pm.headers[title(payloadKey)] = pv
 			}
 		case "bodyB":
 			mb := &messageBody{}
@@ -337,6 +347,11 @@ type replayDataOpts struct {
 	encryptionKeyFile           string
 	resumeStateFile             string
 	targetHTTPClient            *http.Client
+	// channelPrefix is the subscribed prefix, empty for the whole server.
+	// prefixMode says the subscription is a subtree subscription, in which case
+	// the channel below channelPrefix is appended to targetURL.
+	channelPrefix string
+	prefixMode    bool
 }
 
 type targetDeliveryError struct {
@@ -348,6 +363,9 @@ type targetDeliveryError struct {
 	deliveryID string
 	eventType  string
 	retryAfter time.Duration
+	// target is the URL the delivery actually used. In prefix mode it differs
+	// from replayDataOpts.targetURL, which only holds the base URL.
+	target string
 }
 
 func (e *targetDeliveryError) Error() string {
@@ -422,6 +440,38 @@ func parseRetryAfter(resp *http.Response) time.Duration {
 	return delay
 }
 
+// channelSuffix returns the part of channel below prefix. It gives an error
+// when channel is neither prefix itself nor a descendant of prefix, which keeps
+// a subtree delivery inside the subscribed subtree.
+func channelSuffix(prefix, channel string) (string, error) {
+	if prefix == "" {
+		return channel, nil
+	}
+	if channel == prefix {
+		return "", nil
+	}
+	if !strings.HasPrefix(channel, prefix+"/") {
+		return "", fmt.Errorf("channel %q is not below prefix %q", channel, prefix)
+	}
+	return channel[len(prefix)+1:], nil
+}
+
+// targetURLForSuffix appends suffix to the path of baseURL and keeps the query
+// and the fragment. An empty suffix or an empty baseURL returns baseURL as it
+// is.
+func targetURLForSuffix(baseURL, suffix string) (string, error) {
+	if baseURL == "" || suffix == "" {
+		return baseURL, nil
+	}
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		return "", err
+	}
+	parsed.Path = strings.TrimSuffix(parsed.Path, "/") + "/" + suffix
+	parsed.RawPath = ""
+	return parsed.String(), nil
+}
+
 func redactTargetURL(raw string) string {
 	parsed, err := url.Parse(raw)
 	if err != nil {
@@ -442,11 +492,15 @@ func deliveryAttrs(ropts *replayDataOpts, pm payloadMsg, streamID string, attemp
 	if err.eventType != "" {
 		eventType = err.eventType
 	}
+	target := ropts.targetURL
+	if err.target != "" {
+		target = err.target
+	}
 	attrs := []slog.Attr{
 		slog.String("delivery_id", deliveryID),
 		slog.String("stream_id", streamID),
 		slog.String("event_type", eventType),
-		slog.String("target", redactTargetURL(ropts.targetURL)),
+		slog.String("target", redactTargetURL(target)),
 		slog.Int("attempt", attempt),
 		slog.Int("max_attempts", maxAttempts),
 		slog.Int64("duration_ms", err.duration.Milliseconds()),
@@ -473,7 +527,7 @@ func replayDataWithStatusPolicy(ropts *replayDataOpts, logger *slog.Logger, pm p
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ropts.targetURL, bytes.NewReader(pm.body))
 	if err != nil {
-		return &targetDeliveryError{err: err, kind: "request", duration: time.Since(started), deliveryID: pm.eventID, eventType: pm.eventType}
+		return &targetDeliveryError{err: err, kind: "request", duration: time.Since(started), deliveryID: pm.eventID, eventType: pm.eventType, target: ropts.targetURL}
 	}
 	for k, v := range pm.headers {
 		req.Header.Add(k, v)
@@ -484,7 +538,7 @@ func replayDataWithStatusPolicy(ropts *replayDataOpts, logger *slog.Logger, pm p
 	resp, err := targetHTTPClient(ropts).Do(req) //nolint:gosec // user-configured URL
 	if err != nil {
 		kind, retryable := classifyTargetError(err)
-		return &targetDeliveryError{err: err, kind: kind, retryable: retryable, duration: time.Since(started), deliveryID: pm.eventID, eventType: pm.eventType}
+		return &targetDeliveryError{err: err, kind: kind, retryable: retryable, duration: time.Since(started), deliveryID: pm.eventID, eventType: pm.eventType, target: ropts.targetURL}
 	}
 	defer func() {
 		// Drain a bounded amount of the body so the shared transport can
@@ -530,6 +584,7 @@ func replayDataWithStatusPolicy(ropts *replayDataOpts, logger *slog.Logger, pm p
 			deliveryID: pm.eventID,
 			eventType:  pm.eventType,
 			retryAfter: parseRetryAfter(resp),
+			target:     ropts.targetURL,
 		}
 	}
 	return nil
@@ -584,6 +639,7 @@ func runExecCommand(ctx context.Context, rd *replayDataOpts, logger *slog.Logger
 		"GOSMEE_EVENT_ID="+pm.eventID,
 		"GOSMEE_CONTENT_TYPE="+pm.contentType,
 		"GOSMEE_TIMESTAMP="+pm.timestamp,
+		"GOSMEE_CHANNEL="+pm.channel,
 		"GOSMEE_PAYLOAD_FILE="+payloadFile.Name(),
 		"GOSMEE_HEADERS_FILE="+headersFile.Name(),
 	)
@@ -816,40 +872,82 @@ func isOlderVersion(v1, v2 []int) bool {
 	return len(v1) < len(v2)
 }
 
-func prepareSubscription(smeeURL, encryptionKeyFile string) (channel, sseURL string, privateKey *[32]byte, err error) {
+// subscription holds everything the client needs to open one SSE stream.
+type subscription struct {
+	// Channel is the exact channel, or the subscribed prefix in prefix mode.
+	Channel    string
+	Prefix     bool
+	SSEURL     string
+	PrivateKey *[32]byte
+}
+
+// clientPrefixMode reports whether the client subscribes to a subtree. A smee
+// URL with no path can only mean the whole server, which is an error today, so
+// prefix mode is inferred there.
+func clientPrefixMode(flagSet bool, smeeURL string) bool {
+	if flagSet {
+		return true
+	}
 	if strings.HasPrefix(smeeURL, "https://smee.io") {
-		if encryptionKeyFile != "" {
-			return "", "", nil, fmt.Errorf("client key files are only supported with gosmee server URLs, not https://smee.io")
+		return false
+	}
+	parsed, err := url.Parse(smeeURL)
+	if err != nil {
+		return false
+	}
+	return strings.Trim(parsed.Path, "/") == ""
+}
+
+func prepareSubscription(smeeURL, encryptionKeyFile string, prefixMode bool) (subscription, error) {
+	if strings.HasPrefix(smeeURL, "https://smee.io") {
+		if prefixMode {
+			return subscription{}, fmt.Errorf("subtree (prefix) subscriptions are only supported with gosmee server URLs, not https://smee.io")
 		}
-		return smeeChannel, smeeURL, nil, nil
+		if encryptionKeyFile != "" {
+			return subscription{}, fmt.Errorf("client key files are only supported with gosmee server URLs, not https://smee.io")
+		}
+		return subscription{Channel: smeeChannel, SSEURL: smeeURL}, nil
 	}
 
 	// A channel id can span several path segments, and a gosmee server always
 	// serves from the root of its host, so the whole path is the channel.
 	parsedSmeeURL, err := url.Parse(smeeURL)
 	if err != nil {
-		return "", "", nil, fmt.Errorf("parse smee url: %w", err)
+		return subscription{}, fmt.Errorf("parse smee url: %w", err)
 	}
-	channel = strings.Trim(parsedSmeeURL.Path, "/")
-	if channel == "" {
-		return "", "", nil, fmt.Errorf("no channel in smee url %s", smeeURL)
+	channel := strings.Trim(parsedSmeeURL.Path, "/")
+	if channel == "" && !prefixMode {
+		return subscription{}, fmt.Errorf("no channel in smee url %s", smeeURL)
+	}
+	if channel != "" && !isValidChannelID(channel) {
+		return subscription{}, fmt.Errorf("channel %q must match %q", channel, channelIDPattern)
 	}
 
 	parsedSSEURL := *parsedSmeeURL
+	// The root form must keep its trailing slash: /events reaches the index
+	// page and answers with HTML into the SSE parser.
 	parsedSSEURL.Path = "/events/" + channel
 	parsedSSEURL.RawPath = ""
 	parsedSSEURL.RawQuery = ""
-	if encryptionKeyFile == "" {
-		return channel, parsedSSEURL.String(), nil, nil
+
+	query := url.Values{}
+	if prefixMode {
+		query.Set("prefix", "1")
 	}
 
-	publicKey, loadedPrivateKey, err := LoadKeyPair(encryptionKeyFile)
-	if err != nil {
-		return "", "", nil, fmt.Errorf("load encryption keys: %w", err)
+	sub := subscription{Channel: channel, Prefix: prefixMode}
+	if encryptionKeyFile != "" {
+		publicKey, loadedPrivateKey, err := LoadKeyPair(encryptionKeyFile)
+		if err != nil {
+			return subscription{}, fmt.Errorf("load encryption keys: %w", err)
+		}
+		query.Set("pubkey", EncodePublicKey(publicKey))
+		sub.PrivateKey = loadedPrivateKey
 	}
-	parsedSSEURL.RawQuery = url.Values{"pubkey": {EncodePublicKey(publicKey)}}.Encode()
+	parsedSSEURL.RawQuery = query.Encode()
+	sub.SSEURL = parsedSSEURL.String()
 
-	return channel, parsedSSEURL.String(), loadedPrivateKey, nil
+	return sub, nil
 }
 
 type resumeState struct {
@@ -1065,20 +1163,41 @@ func (c goSmee) processClientEvent(now time.Time, event clientSSEEvent, privateK
 	}
 	pm.streamID = event.ID
 
-	if c.replayDataOpts.saveDir != "" {
-		if err := saveData(c.replayDataOpts, c.logger, pm); err != nil {
+	ropts := c.replayDataOpts
+	if c.replayDataOpts.prefixMode && pm.channel != "" {
+		// pm.channel comes from the server. url.URL.String does not clean "..",
+		// and the Go HTTP client sends the raw path, so a bad server could make
+		// the client POST outside the target path without these two checks.
+		if !isValidChannelID(pm.channel) {
+			return false, permanentClientProcessingError("server sent an invalid channel %q", pm.channel)
+		}
+		suffix, err := channelSuffix(c.replayDataOpts.channelPrefix, pm.channel)
+		if err != nil {
+			return false, permanentClientProcessingError("resolving channel suffix: %w", err)
+		}
+		resolved, err := targetURLForSuffix(c.replayDataOpts.targetURL, suffix)
+		if err != nil {
+			return false, permanentClientProcessingError("resolving target url: %w", err)
+		}
+		optsCopy := *c.replayDataOpts
+		optsCopy.targetURL = resolved
+		ropts = &optsCopy
+	}
+
+	if ropts.saveDir != "" {
+		if err := saveData(ropts, c.logger, pm); err != nil {
 			return false, fmt.Errorf("saving message: %w", err)
 		}
 	}
 
-	if !c.replayDataOpts.noReplay {
-		if err := replayDataWithStatusPolicy(c.replayDataOpts, c.logger, pm, true); err != nil {
+	if !ropts.noReplay {
+		if err := replayDataWithStatusPolicy(ropts, c.logger, pm, true); err != nil {
 			return false, fmt.Errorf("forwarding event %q: %w", pm.eventType, err)
 		}
 	}
 
-	if c.replayDataOpts.execCommand != "" {
-		if err := runExecCommand(context.Background(), c.replayDataOpts, c.logger, pm); err != nil {
+	if ropts.execCommand != "" {
+		if err := runExecCommand(context.Background(), ropts, c.logger, pm); err != nil {
 			return false, fmt.Errorf("exec command failed for event %q: %w", pm.eventType, err)
 		}
 	}
@@ -1212,7 +1331,20 @@ func (c goSmee) consumeSSEStream(ctx context.Context, httpClient *http.Client, s
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("SSE endpoint returned %s", resp.Status)
+		message := fmt.Sprintf("SSE endpoint returned %s", resp.Status)
+		if body, readErr := io.ReadAll(io.LimitReader(resp.Body, 512)); readErr == nil && len(bytes.TrimSpace(body)) > 0 {
+			message = fmt.Sprintf("%s: %s", message, strings.TrimSpace(string(body)))
+		}
+		// A 400 is a configuration fault the server will keep rejecting. A 404
+		// is the protected-channel rejection, which stays retryable so that an
+		// operator who reloads a channels file does not kill live clients.
+		if resp.StatusCode == http.StatusBadRequest {
+			return permanentClientProcessingError("%s", message)
+		}
+		return errors.New(message)
+	}
+	if c.replayDataOpts.prefixMode && resp.Header.Get(subscriptionHeaderName) != subscriptionPrefixValue {
+		return permanentClientProcessingError("server did not acknowledge the subtree (prefix) subscription; it is too old to support it")
 	}
 	reconnectBackoff.Reset()
 
@@ -1290,16 +1422,23 @@ func (c goSmee) clientSetup() error {
 		c.logger.WarnContext(context.Background(), fmt.Sprintf("%sCould not get server version: %s", emoji("⚠", "yellow+b", c.replayDataOpts.decorate), err.Error()))
 	}
 
-	_, sseURL, privateKey, err := prepareSubscription(c.replayDataOpts.smeeURL, c.replayDataOpts.encryptionKeyFile)
+	sub, err := prepareSubscription(c.replayDataOpts.smeeURL, c.replayDataOpts.encryptionKeyFile, c.replayDataOpts.prefixMode)
 	if err != nil {
 		return err
 	}
-	if privateKey != nil {
+	if sub.PrivateKey != nil {
 		c.logger.InfoContext(context.Background(), fmt.Sprintf("%sProtected channel mode enabled for gosmee SSE transport", emoji("🔐", "green+b", c.replayDataOpts.decorate)))
+	}
+	// replayDataOpts is a pointer, and every goSmee method has a value
+	// receiver, so the prefix state must live here to survive this function.
+	c.replayDataOpts.channelPrefix = sub.Channel
+	c.replayDataOpts.prefixMode = sub.Prefix
+	if sub.Prefix {
+		c.logger.InfoContext(context.Background(), fmt.Sprintf("%sSubtree mode enabled: every channel below %q goes to the target URL with its remaining path", emoji("⇉", "green+b", c.replayDataOpts.decorate), sub.Channel))
 	}
 
 	c.logger.InfoContext(context.Background(), fmt.Sprintf("%sConfigured reconnection strategy to retry indefinitely", emoji("⇉", "blue+b", c.replayDataOpts.decorate)))
-	return c.runSSEClient(context.Background(), sseURL, version, privateKey)
+	return c.runSSEClient(context.Background(), sub.SSEURL, version, sub.PrivateKey)
 }
 
 func serveHealthEndpoint(port int, logger *slog.Logger, decorate bool) {

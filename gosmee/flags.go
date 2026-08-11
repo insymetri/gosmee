@@ -158,6 +158,12 @@ var clientFlags = []cli.Flag{
 		Usage:   "Path to persist the last successfully processed Redis stream ID for durable resume",
 		EnvVars: []string{"GOSMEE_RESUME_STATE_FILE"},
 	},
+	&cli.BoolFlag{
+		Name:    "prefix",
+		Usage:   "Subscribe to every channel below the URL path and append the remaining path to the target URL. Inferred when the gosmee URL has no path",
+		Value:   false,
+		EnvVars: []string{"GOSMEE_PREFIX"},
+	},
 }
 
 var serverFlags = []cli.Flag{
@@ -232,6 +238,12 @@ var serverFlags = []cli.Flag{
 		Name:    "encrypted-channels-file",
 		Usage:   "Optional JSON file describing protected channel IDs and allowed client public keys",
 		EnvVars: []string{"GOSMEE_ENCRYPTED_CHANNELS_FILE"},
+	},
+	&cli.BoolFlag{
+		Name:    "allow-open-root-subscription",
+		Usage:   "Allow a subtree subscription to the whole server without a \"*\" entry in --encrypted-channels-file. Off by default",
+		Value:   false,
+		EnvVars: []string{"GOSMEE_ALLOW_OPEN_ROOT_SUBSCRIPTION"},
 	},
 	&cli.StringFlag{
 		Name:    "cors-origin",

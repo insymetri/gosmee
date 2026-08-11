@@ -44,7 +44,7 @@ func TestHandleEventsGetLogsDisconnect(t *testing.T) {
 	broker := NewEventBroker(logger)
 
 	router := chi.NewRouter()
-	router.Get(eventsPath, handleEventsGet(broker, nil, "*"))
+	router.Get(eventsPath, handleEventsGet(broker, nil, "*", false))
 
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/events/plain-channel", nil)
 	reqCtx, cancel := context.WithCancel(req.Context())
