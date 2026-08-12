@@ -79,8 +79,23 @@ func (f *fakeRedisStreamClient) Close() error {
 
 func redisStreamRouter(relay *redisPayloadRelay, protectedChannels *ProtectedChannels) *chi.Mux {
 	router := chi.NewRouter()
-	router.Get(eventsPath, handleRedisEventsGet(relay, protectedChannels, "*"))
+	router.Get(eventsPath, handleRedisEventsGet(relay, protectedChannels, "*", false))
 	return router
+}
+
+func TestHandleRedisEventsGetRejectsPrefix(t *testing.T) {
+	protectedChannels, err := LoadProtectedChannels("")
+	assert.NilError(t, err)
+	relay := newRedisPayloadRelayWithClient(&fakeRedisStreamClient{}, 10000)
+	router := redisStreamRouter(relay, protectedChannels)
+
+	for _, path := range []string{"/events/team?prefix=1", "/events/?prefix=1"} {
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodGet, path, nil))
+
+		assert.Equal(t, w.Code, http.StatusBadRequest, "path %q should be rejected", path)
+		assert.Assert(t, strings.Contains(w.Body.String(), "--redis-url"), w.Body.String())
+	}
 }
 
 func waitForRedisReads(t *testing.T, client *fakeRedisStreamClient) {

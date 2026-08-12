@@ -212,6 +212,41 @@ This command saves the JSON data of new payloads to `/tmp/savedreplay/timestamp.
 
 You can configure the SSE client buffer size (in bytes) with the `--sse-buffer-size` flag. The default is `1048576` (1MB).
 
+#### Subtree (prefix) subscriptions
+
+One client can subscribe to a channel prefix instead of one exact channel. gosmee then relays every channel below that prefix and adds the remaining path to the target URL:
+
+```shell
+gosmee client --prefix https://myserverurl/aBcDeF http://localhost:8080
+```
+
+| Webhook sent to | Replayed to |
+|---|---|
+| `POST /aBcDeF/github/push` | `POST http://localhost:8080/github/push` |
+| `POST /aBcDeF/stripe` | `POST http://localhost:8080/stripe` |
+| `POST /aBcDeF` | `POST http://localhost:8080/` |
+
+The prefix stays on the gosmee server and never becomes part of the local path, so a secret prefix does not go to the local application.
+
+A target URL with a path keeps that path. With `http://localhost:8080/api`, the channel `aBcDeF/github/push` goes to `http://localhost:8080/api/github/push`. A query string in the target URL also stays.
+
+gosmee sets `--prefix` automatically when the gosmee URL has no path. This subscribes to the whole server:
+
+```shell
+gosmee client https://myserverurl http://localhost:8080
+```
+
+A subscription to the whole server needs a `"*"` entry in the server's `--encrypted-channels-file`, or the server must run with `--allow-open-root-subscription`. If neither is true, the server answers with a generic not-found response.
+
+With `--exec`, the environment variable `GOSMEE_CHANNEL` contains the channel of the event.
+
+Notes:
+
+- Subtree subscriptions need a gosmee server that supports them. If the server does not acknowledge the subscription, the client stops with an error instead of sending all events to the base target URL.
+- Subtree subscriptions are not available when the server runs with `--redis-url`. The server answers with a 400 and the client stops.
+- `https://smee.io` does not support subtree subscriptions.
+- With `--saveDir`, the file name comes from the timestamp only. Two channels in the same subtree that receive an event in the same millisecond can write to the same file.
+
 #### Protected channels
 
 Protected channels are optional and only apply to channel IDs listed in the server's `--encrypted-channels-file`.
@@ -230,7 +265,7 @@ Generate a keypair once:
 gosmee keygen --key-file ~/.config/gosmee/client-key.json
 ```
 
-This writes the private key file and prints the corresponding public key to stdout. Add that public key to the server's protected-channel config.
+This writes the keypair file and prints the public key to stdout. Add that public key to the server's protected-channel config. The `public_key` field in the keypair file holds the same value, so you can copy it from either place.
 
 Then connect with the key file:
 
@@ -244,6 +279,7 @@ Notes:
 - For gosmee channels that are not listed in `--encrypted-channels-file`, `--encryption-key-file` is not needed and payloads stay plaintext.
 - Payloads are encrypted from the gosmee server to authorized clients. The gosmee server still sees plaintext when it receives the webhook.
 - Saved payloads from `--saveDir` are written after decryption on the client side.
+- An entry in `--encrypted-channels-file` protects that channel and every channel below it. An entry `CHANNEL_ID` also protects `CHANNEL_ID/github/push`. See [Protected client channels](#protected-client-channels).
 
 For those who prefer [HTTPie](https://httpie.io) over cURL, you can generate HTTPie-based replay scripts:
 
@@ -292,6 +328,7 @@ The payload and headers are written to temporary files (automatically cleaned up
 | `GOSMEE_TIMESTAMP` | The timestamp of the event |
 | `GOSMEE_PAYLOAD_FILE` | Path to a temporary file containing the JSON payload body |
 | `GOSMEE_HEADERS_FILE` | Path to a temporary file containing the webhook headers as JSON |
+| `GOSMEE_CHANNEL` | The channel of the event. Empty if the server is too old to send it |
 
 To only run the command for specific event types, use `--exec-on-events`:
 
@@ -368,6 +405,8 @@ Empty segments (`//`), leading and trailing slashes, and any other character are
 rejected. `/events/` and `/replay/` are reserved prefixes, so a channel ID cannot
 start with either.
 
+The server adds the channel to each event it sends to clients. The client makes it available as `$GOSMEE_CHANNEL` for `--exec`, and forwards it to the target as the `X-Gosmee-Channel` header. A client that is too old to know the channel forwards the same header, so the target sees the channel in both cases. The server ignores an `X-Gosmee-Channel` header sent by the webhook itself.
+
 Generate a random ID easily with the `/new` endpoint:
 
 ```shell
@@ -415,6 +454,8 @@ gosmee client \
 
 The client only advances this checkpoint after parsing, optional `--saveDir`, target forwarding, and optional `--exec` all succeed. In Redis Streams mode, transient target failures are retried forever with backoff; permanent target responses (for example 401 or 422) stop the client without advancing the checkpoint. Without `--resume-state-file`, reconnect resume works only for the current process; restarts start live.
 
+Redis Streams mode does not support [subtree (prefix) subscriptions](#subtree-prefix-subscriptions). The server answers such a subscription with a 400 and the client stops with that message.
+
 #### Protected client channels
 
 If you want specific channels to be key-protected, provide `--encrypted-channels-file`. Only the channels listed in that file require authorized client keys and encrypted SSE delivery. All other gosmee channels continue to work in legacy plaintext mode.
@@ -450,6 +491,48 @@ Important:
 - A protected channel only delivers to clients whose public key is listed for that channel.
 - Unauthorized subscribers to a protected channel receive a generic not-found response.
 - The built-in browser UI and `/new` remain available for plaintext channels, but protected channels are not exposed through the browser UI.
+
+##### Subtrees and protected channels
+
+An entry protects that channel and every channel below it, on segment boundaries. The entry `customer-a-channel` protects:
+
+- `customer-a-channel`
+- `customer-a-channel/github/push`
+
+It does not protect `customer-a-channel-2`, because `-2` does not start a new segment.
+
+> **Change of behaviour:** before this release an entry protected only the exact channel, and `customer-a-channel/github/push` was open in plaintext mode. The new rule only makes access more strict, but a client that used a channel below a protected entry must now supply an authorized key.
+
+The nearest entry above a channel decides who can subscribe. With these two entries:
+
+```json
+{
+  "channels": {
+    "team": { "allowed_public_keys": ["KEY_1"] },
+    "team/secret": { "allowed_public_keys": ["KEY_2"] }
+  }
+}
+```
+
+`KEY_1` can subscribe to `team` and `team/build`, but not to `team/secret` or `team/secret/x`. Only `KEY_2` can subscribe to those. This lets you delegate a subtree to a different key.
+
+> **Change of behaviour:** before this release `KEY_1` also unlocked `team/secret`, because each entry was independent. Nested entries only became possible in a recent release.
+
+Use the entry `"*"` to protect the whole server, which is also the entry that lets a client subscribe to the root:
+
+```json
+{
+  "channels": {
+    "*": { "allowed_public_keys": ["CLIENT_PUBLIC_KEY_1"] }
+  }
+}
+```
+
+With a `"*"` entry the browser UI and `/new` answer with a not-found response, because no plaintext channel is available.
+
+A [subtree subscription](#subtree-prefix-subscriptions) must be authorized for every protected channel below the prefix. If a key can subscribe to `team` but a different key protects `team/secret`, the subscription to `team` is refused with the generic not-found response. gosmee does not deliver a part of the subtree silently.
+
+To let a client subscribe to the root without a `"*"` entry, start the server with `--allow-open-root-subscription` (or `GOSMEE_ALLOW_OPEN_ROOT_SUBSCRIPTION=true`). One such client then receives every webhook the server accepts, so only use this on a private server.
 
 #### Caddy
 

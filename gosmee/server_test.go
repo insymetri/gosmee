@@ -124,6 +124,111 @@ func TestEventBroker(t *testing.T) {
 	})
 }
 
+func TestEventBrokerPrefixSubscriptions(t *testing.T) {
+	drain := func(t *testing.T, subscriber *Subscriber) []string {
+		t.Helper()
+
+		var received []string
+		for {
+			select {
+			case event := <-subscriber.Events:
+				received = append(received, string(event.Data))
+			default:
+				return received
+			}
+		}
+	}
+
+	t.Run("a prefix subscriber receives its whole subtree", func(t *testing.T) {
+		eb := NewEventBroker()
+		subscriber := eb.SubscribePrefix("a", nil)
+		defer eb.Unsubscribe("a", subscriber)
+
+		assert.Equal(t, subscriber.Channel, "a")
+		assert.Assert(t, subscriber.Prefix)
+
+		for _, channel := range []string{"a", "a/b", "a/b/c", "ab", "abc/x", "b", "b/a"} {
+			eb.Publish(channel, []byte(channel))
+		}
+
+		assert.DeepEqual(t, drain(t, subscriber), []string{"a", "a/b", "a/b/c"})
+	})
+
+	t.Run("a root prefix subscriber receives everything", func(t *testing.T) {
+		eb := NewEventBroker()
+		subscriber := eb.SubscribePrefix("", nil)
+		defer eb.Unsubscribe("", subscriber)
+
+		for _, channel := range []string{"a", "a/b", "zzz", "other/deep/path"} {
+			eb.Publish(channel, []byte(channel))
+		}
+
+		assert.DeepEqual(t, drain(t, subscriber), []string{"a", "a/b", "zzz", "other/deep/path"})
+	})
+
+	t.Run("an exact subscriber still only receives its own channel", func(t *testing.T) {
+		eb := NewEventBroker()
+		subscriber := eb.Subscribe("a", nil)
+		defer eb.Unsubscribe("a", subscriber)
+
+		assert.Assert(t, !subscriber.Prefix)
+
+		eb.Publish("a/b", []byte("a/b"))
+		eb.Publish("a", []byte("a"))
+
+		assert.DeepEqual(t, drain(t, subscriber), []string{"a"})
+	})
+
+	t.Run("exact and prefix subscribers on the same channel each get one copy", func(t *testing.T) {
+		eb := NewEventBroker()
+		exact := eb.Subscribe("a", nil)
+		defer eb.Unsubscribe("a", exact)
+		prefix := eb.SubscribePrefix("a", nil)
+		defer eb.Unsubscribe("a", prefix)
+
+		eb.Publish("a", []byte("a"))
+
+		assert.DeepEqual(t, drain(t, exact), []string{"a"})
+		assert.DeepEqual(t, drain(t, prefix), []string{"a"})
+	})
+
+	t.Run("unsubscribe closes the channel and drops the key", func(t *testing.T) {
+		eb := NewEventBroker()
+		subscriber := eb.SubscribePrefix("a", nil)
+
+		eb.Lock()
+		assert.Equal(t, len(eb.prefixSubscribers["a"]), 1)
+		eb.Unlock()
+
+		eb.Unsubscribe("a", subscriber)
+
+		eb.Lock()
+		_, ok := eb.prefixSubscribers["a"]
+		eb.Unlock()
+		assert.Assert(t, !ok, "prefix state should be removed when the last subscriber unsubscribes")
+
+		_, isOpen := <-subscriber.Events
+		assert.Assert(t, !isOpen, "Channel should be closed after unsubscribing")
+	})
+
+	t.Run("a prefix subscriber with a public key receives ciphertext", func(t *testing.T) {
+		eb := NewEventBroker()
+		publicKey, privateKey, err := GenerateKeyPair()
+		assert.NilError(t, err)
+
+		subscriber := eb.SubscribePrefix("a", publicKey)
+		defer eb.Unsubscribe("a", subscriber)
+
+		eb.Publish("a/b", []byte(`{"secret":true}`))
+
+		event := <-subscriber.Events
+		assert.Assert(t, IsEncrypted(event.Data))
+		decrypted, err := Decrypt(event.Data, privateKey)
+		assert.NilError(t, err)
+		assert.DeepEqual(t, decrypted, []byte(`{"secret":true}`))
+	})
+}
+
 func TestWebhookSignatureValidation(t *testing.T) {
 	t.Run("GitHub Signature", func(t *testing.T) {
 		secret := "test-secret"
@@ -545,7 +650,7 @@ func TestHandleEventsGet(t *testing.T) {
 		"test-channel": {allowedKey},
 	})
 	router := chi.NewRouter()
-	router.Get(eventsPath, handleEventsGet(eventBroker, protectedChannels, "*"))
+	router.Get(eventsPath, handleEventsGet(eventBroker, protectedChannels, "*", false))
 
 	t.Run("Rejects Invalid Public Key", func(t *testing.T) {
 		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/events/test-channel?pubkey=!!!", nil)
@@ -638,7 +743,7 @@ func TestHandleEventsGet(t *testing.T) {
 			"test-channel": {allowed},
 		})
 		router = chi.NewRouter()
-		router.Get(eventsPath, handleEventsGet(eventBroker, protectedChannels, "*"))
+		router.Get(eventsPath, handleEventsGet(eventBroker, protectedChannels, "*", false))
 
 		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/events/test-channel?pubkey="+url.QueryEscape(allowed), nil)
 		reqCtx, cancel := context.WithCancel(req.Context())
@@ -679,6 +784,164 @@ func TestHandleEventsGet(t *testing.T) {
 	})
 }
 
+// authorizeEventSubscriber writes its own rejections, so drive it through a
+// real chi router and report what it authorized instead of blocking on SSE.
+func authorizeProbeRouter(protectedChannels *ProtectedChannels, allowOpenRoot bool) *chi.Mux {
+	router := chi.NewRouter()
+	router.Get(eventsPath, func(w http.ResponseWriter, r *http.Request) {
+		sub, ok := authorizeEventSubscriber(w, r, protectedChannels, allowOpenRoot)
+		if !ok {
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"channel": sub.Channel,
+			"prefix":  sub.Prefix,
+			"hasKey":  sub.PubKey != nil,
+		})
+	})
+	return router
+}
+
+func TestAuthorizeEventSubscriberPrefix(t *testing.T) {
+	subscriberKey := mustGeneratePublicKey(t)
+	otherKey := mustGeneratePublicKey(t)
+
+	get := func(t *testing.T, router *chi.Mux, path string) *httptest.ResponseRecorder {
+		t.Helper()
+
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodGet, path, nil))
+		return w
+	}
+
+	assertAuthorized := func(t *testing.T, w *httptest.ResponseRecorder, channel string, prefix, hasKey bool) {
+		t.Helper()
+
+		assert.Equal(t, w.Code, http.StatusOK)
+		var got map[string]any
+		assert.NilError(t, json.Unmarshal(w.Body.Bytes(), &got))
+		assert.Equal(t, got["channel"], channel)
+		assert.Equal(t, got["prefix"], prefix)
+		assert.Equal(t, got["hasKey"], hasKey)
+	}
+
+	openChannels, err := LoadProtectedChannels("")
+	assert.NilError(t, err)
+
+	t.Run("no prefix parameter keeps exact mode", func(t *testing.T) {
+		assertAuthorized(t, get(t, authorizeProbeRouter(openChannels, false), "/events/abc"), "abc", false, false)
+	})
+
+	t.Run("prefix mode on an unprotected subtree needs no key", func(t *testing.T) {
+		assertAuthorized(t, get(t, authorizeProbeRouter(openChannels, false), "/events/abc?prefix=1"), "abc", true, false)
+	})
+
+	t.Run("root subscription is gated unless explicitly opened", func(t *testing.T) {
+		assert.Equal(t, get(t, authorizeProbeRouter(openChannels, false), "/events/?prefix=1").Code, http.StatusNotFound)
+		assertAuthorized(t, get(t, authorizeProbeRouter(openChannels, true), "/events/?prefix=1"), "", true, false)
+	})
+
+	t.Run("wildcard entry authorizes the root for its key", func(t *testing.T) {
+		wildcardChannels := mustProtectedChannels(t, map[string][]string{
+			"*": {subscriberKey},
+		})
+		router := authorizeProbeRouter(wildcardChannels, false)
+
+		assertAuthorized(t, get(t, router, "/events/?prefix=1&pubkey="+url.QueryEscape(subscriberKey)), "", true, true)
+		assert.Equal(t, get(t, router, "/events/?prefix=1&pubkey="+url.QueryEscape(otherKey)).Code, http.StatusNotFound)
+		assert.Equal(t, get(t, router, "/events/?prefix=1").Code, http.StatusNotFound)
+	})
+
+	// The security story: a subtree subscription must be authorized for every
+	// protected channel it can observe.
+	t.Run("a protected descendant gates the whole subtree", func(t *testing.T) {
+		protectedChannels := mustProtectedChannels(t, map[string][]string{
+			"abc/secret": {subscriberKey},
+		})
+		router := authorizeProbeRouter(protectedChannels, false)
+
+		assert.Equal(t, get(t, router, "/events/abc?prefix=1").Code, http.StatusNotFound)
+		assert.Equal(t, get(t, router, "/events/abc?prefix=1&pubkey="+url.QueryEscape(otherKey)).Code, http.StatusNotFound)
+		assertAuthorized(t, get(t, router, "/events/abc?prefix=1&pubkey="+url.QueryEscape(subscriberKey)), "abc", true, true)
+	})
+
+	t.Run("a delegated descendant is not unlocked by the parent key", func(t *testing.T) {
+		protectedChannels := mustProtectedChannels(t, map[string][]string{
+			"abc":        {subscriberKey},
+			"abc/secret": {otherKey},
+		})
+		router := authorizeProbeRouter(protectedChannels, false)
+
+		assert.Equal(t, get(t, router, "/events/abc?prefix=1&pubkey="+url.QueryEscape(subscriberKey)).Code, http.StatusNotFound)
+		assertAuthorized(t, get(t, router, "/events/abc/secret?prefix=1&pubkey="+url.QueryEscape(otherKey)), "abc/secret", true, true)
+	})
+
+	// A protected entry covers its subtree, so an exact subscription below it
+	// cannot be used to walk around the prefix gate.
+	t.Run("exact mode honors ancestor protection", func(t *testing.T) {
+		protectedChannels := mustProtectedChannels(t, map[string][]string{
+			"abc": {subscriberKey},
+		})
+		router := authorizeProbeRouter(protectedChannels, false)
+
+		assert.Equal(t, get(t, router, "/events/abc/secret").Code, http.StatusNotFound)
+		assertAuthorized(t, get(t, router, "/events/abc/secret?pubkey="+url.QueryEscape(subscriberKey)), "abc/secret", false, true)
+	})
+
+	// Behavior kept from before prefix mode: on an unprotected channel an
+	// unparseable pubkey is ignored rather than rejected.
+	t.Run("exact mode still ignores a bad key on an unprotected channel", func(t *testing.T) {
+		assertAuthorized(t, get(t, authorizeProbeRouter(openChannels, false), "/events/abc?pubkey=!!!"), "abc", false, false)
+	})
+
+	t.Run("invalid requests are rejected", func(t *testing.T) {
+		router := authorizeProbeRouter(openChannels, false)
+
+		assert.Equal(t, get(t, router, "/events/abc?prefix=notabool").Code, http.StatusBadRequest)
+		assert.Equal(t, get(t, router, "/events/abc?prefix=").Code, http.StatusBadRequest)
+		assert.Equal(t, get(t, router, "/events/has.dot?prefix=1").Code, http.StatusBadRequest)
+		assert.Equal(t, get(t, router, "/events/?prefix=1&pubkey=!!!").Code, http.StatusNotFound)
+	})
+}
+
+func TestHandleEventsGetPrefixSubscription(t *testing.T) {
+	eventBroker := NewEventBroker()
+	protectedChannels, err := LoadProtectedChannels("")
+	assert.NilError(t, err)
+	router := chi.NewRouter()
+	router.Get(eventsPath, handleEventsGet(eventBroker, protectedChannels, "*", false))
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/events/team?prefix=1", nil)
+	reqCtx, cancel := context.WithCancel(req.Context())
+	req = req.WithContext(reqCtx)
+	defer cancel()
+
+	response := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		router.ServeHTTP(response, req)
+		close(done)
+	}()
+
+	assert.Assert(t, eventually(t, func() bool {
+		eventBroker.RLock()
+		defer eventBroker.RUnlock()
+		return len(eventBroker.prefixSubscribers["team"]) == 1
+	}))
+
+	eventBroker.Publish("team/github/push", []byte(`{"subtree":true}`))
+
+	assert.Assert(t, eventually(t, func() bool {
+		return strings.Contains(response.Body.String(), `{"subtree":true}`)
+	}))
+	// Without this header a client cannot tell an old server from one that
+	// honored the request.
+	assert.Equal(t, response.Header().Get("X-Gosmee-Subscription"), "prefix")
+
+	cancel()
+	<-done
+}
+
 func TestHandleEventsGetCORSOrigin(t *testing.T) {
 	testCases := []struct {
 		name           string
@@ -711,7 +974,7 @@ func TestHandleEventsGetCORSOrigin(t *testing.T) {
 			protectedChannels, err := LoadProtectedChannels("")
 			assert.NilError(t, err)
 			router := chi.NewRouter()
-			router.Get(eventsPath, handleEventsGet(eventBroker, protectedChannels, tc.corsOrigin))
+			router.Get(eventsPath, handleEventsGet(eventBroker, protectedChannels, tc.corsOrigin, false))
 
 			req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/events/plainchannel1", nil)
 			reqCtx, cancel := context.WithCancel(req.Context())
@@ -810,6 +1073,68 @@ func TestServeIndexAndNewURL(t *testing.T) {
 		assert.Assert(t, strings.HasPrefix(strings.TrimSpace(string(body)), "https://example.com/"))
 		assert.Assert(t, !strings.Contains(string(body), "protectedchan"))
 	})
+
+	// A protected entry now protects its whole subtree, so a page below it must
+	// stay hidden too.
+	t.Run("channel under a protected prefix is hidden", func(t *testing.T) {
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/protectedchan/github/push", nil)
+		w := httptest.NewRecorder()
+
+		rctx := chi.NewRouteContext()
+		rctx.URLParams.Add("*", "protectedchan/github/push")
+		req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+
+		handler := serveIndex("https://example.com", "", protectedChannels)
+		handler(w, req)
+
+		assert.Equal(t, w.Result().StatusCode, http.StatusNotFound)
+	})
+
+	t.Run("wildcard entry leaves no public channel to hand out", func(t *testing.T) {
+		wildcardChannels := mustProtectedChannels(t, map[string][]string{
+			"*": {mustGeneratePublicKey(t)},
+		})
+
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/new", nil)
+		w := httptest.NewRecorder()
+		showNewURL("https://example.com", wildcardChannels)(w, req)
+		assert.Equal(t, w.Result().StatusCode, http.StatusNotFound)
+
+		req = httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/", nil)
+		w = httptest.NewRecorder()
+		serveIndex("https://example.com", "", wildcardChannels)(w, req)
+		assert.Equal(t, w.Result().StatusCode, http.StatusNotFound)
+	})
+}
+
+// A "*" entry covers every candidate, so the generator must give up instead of
+// looping forever.
+func TestNextPlaintextChannelWithWildcard(t *testing.T) {
+	wildcardChannels := mustProtectedChannels(t, map[string][]string{
+		"*": {mustGeneratePublicKey(t)},
+	})
+
+	done := make(chan struct{})
+	var channel string
+	var ok bool
+	go func() {
+		defer close(done)
+		channel, ok = nextPlaintextChannel(wildcardChannels)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("nextPlaintextChannel hung on a wildcard protected-channels config")
+	}
+	assert.Assert(t, !ok)
+	assert.Equal(t, channel, "")
+
+	plain, ok := nextPlaintextChannel(mustProtectedChannels(t, map[string][]string{
+		"protectedchan": {mustGeneratePublicKey(t)},
+	}))
+	assert.Assert(t, ok)
+	assert.Equal(t, len(plain), minChannelLength)
 }
 
 func TestEffectivePublicURL(t *testing.T) {
@@ -1007,4 +1332,68 @@ func mustProtectedChannels(t *testing.T, channels map[string][]string) *Protecte
 	protectedChannels, err := LoadProtectedChannels(path)
 	assert.NilError(t, err)
 	return protectedChannels
+}
+
+func TestHandleWebhookPostPublishesChannel(t *testing.T) {
+	var published map[string]any
+	relay := relayFunc(func(_ context.Context, _ string, data []byte) (string, error) {
+		return "", json.Unmarshal(data, &published)
+	})
+
+	router := chi.NewRouter()
+	router.Post(channelPath, handleWebhookPost(newTestContext(), relay, nil))
+
+	post := func(t *testing.T, target string, headers map[string]string) {
+		t.Helper()
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, target, strings.NewReader(`{"a":1}`))
+		req.Header.Set("Content-Type", contentType)
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		assert.Equal(t, w.Code, http.StatusAccepted)
+	}
+
+	t.Run("payload carries the channel", func(t *testing.T) {
+		post(t, "/team/github/push", nil)
+		assert.Equal(t, published["x-gosmee-channel"], "team/github/push")
+	})
+
+	t.Run("a spoofed header does not win", func(t *testing.T) {
+		post(t, "/team/github/push", map[string]string{"X-Gosmee-Channel": "evil"})
+		assert.Equal(t, published["x-gosmee-channel"], "team/github/push")
+	})
+}
+
+func TestHandleReplayPostPublishesChannel(t *testing.T) {
+	var published map[string]any
+	relay := relayFunc(func(_ context.Context, _ string, data []byte) (string, error) {
+		return "", json.Unmarshal(data, &published)
+	})
+
+	router := chi.NewRouter()
+	router.Post(replayPath, handleReplayPost(newTestContext(), relay))
+
+	post := func(t *testing.T, headers map[string]string) {
+		t.Helper()
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/replay/team/github/push", strings.NewReader(`{"a":1}`))
+		req.Header.Set("Content-Type", contentType)
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		assert.Equal(t, w.Code, http.StatusAccepted)
+	}
+
+	t.Run("payload carries the channel", func(t *testing.T) {
+		post(t, nil)
+		assert.Equal(t, published["x-gosmee-channel"], "team/github/push")
+	})
+
+	t.Run("a spoofed header does not win", func(t *testing.T) {
+		post(t, map[string]string{"X-Gosmee-Channel": "evil"})
+		assert.Equal(t, published["x-gosmee-channel"], "team/github/push")
+	})
 }

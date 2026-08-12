@@ -259,6 +259,7 @@ non-publicly accessible endpoint, forward those requests to your local service.`
 							execEnvVars:       c.StringSlice("exec-env-vars"),
 							encryptionKeyFile: c.String("encryption-key-file"),
 							resumeStateFile:   c.String("resume-state-file"),
+							prefixMode:        clientPrefixMode(c.Bool("prefix"), smeeURL),
 						},
 						logger:  logger,
 						channel: c.String("channel"),

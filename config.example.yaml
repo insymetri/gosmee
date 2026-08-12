@@ -78,6 +78,10 @@ client:
   # Persist the last successfully processed Redis stream ID for restart resume
   # resume-state-file: ~/.local/state/gosmee/resume.state
 
+  # Subscribe to every channel below the URL path and add the remaining path to
+  # the target URL. gosmee sets this automatically when smee-url has no path.
+  # prefix: false
+
 # --- server command ---
 server:
   port: 3333
@@ -118,6 +122,10 @@ server:
 
   # JSON file mapping channel IDs to allowed client public keys
   # encrypted-channels-file: /etc/gosmee/encrypted-channels.json
+
+  # Let a client subscribe to the whole server without a "*" entry in
+  # encrypted-channels-file. Keep this off unless the server is private.
+  # allow-open-root-subscription: false
 
   # CORS origin for the SSE endpoint ("*" = all, "" = same-origin only)
   cors-origin: "*"

@@ -212,6 +212,28 @@ The config lists which channels are protected and which client public keys are a
 
 When a subscriber connects to a protected channel, the server checks their public key against the list. Unauthorized clients get a generic not-found response — no information about the channel is leaked. Channels not listed in the config remain normal plaintext channels.
 
+### Which Channels an Entry Protects
+
+An entry protects that channel and every channel below it, on segment boundaries. The entry `my-channel` protects `my-channel` and `my-channel/github/push`, but not `my-channel-2`.
+
+> **Change of behaviour:** before this release an entry protected only the exact channel name, so a channel below a protected entry was open in plaintext mode. The new rule only makes access more strict. Review your config if clients use channels below a protected entry.
+
+The nearest entry above a channel decides who can subscribe. With entries `team` for `KEY_1` and `team/secret` for `KEY_2`, `KEY_1` can subscribe to `team` and `team/build`, but not to `team/secret` or anything below it. Use this to delegate a subtree to a different key.
+
+> **Change of behaviour:** before this release each entry was independent, so `KEY_1` also unlocked `team/secret`.
+
+The entry `"*"` protects every channel on the server. `a/*` and `*/a` are not valid; a single `*` is the only wildcard.
+
+### Subtree Subscriptions
+
+A client can subscribe to a channel prefix with `--prefix` and receive every channel below it. This has three rules:
+
+- A subtree subscription must be authorized for every protected channel below the prefix. If a different key protects one channel in the subtree, the server refuses the whole subscription with the generic not-found response. gosmee never delivers a part of a subtree silently, because "some webhooks stopped arriving" is much more difficult to diagnose than a refused connection.
+- A subscription to the root receives every webhook the server accepts. It needs a `"*"` entry with the client's key, or the server must run with `--allow-open-root-subscription`. Only use that flag on a private server.
+- The prefix stays on the server. The client adds only the remaining path to the target URL, so a secret prefix does not go to the local application.
+
+The client also checks the channel that the server sends with each event. If the channel is not a valid channel name, or is not below the subscribed prefix, the client stops with an error. This prevents a compromised server from making the client send requests to a different path on the local target.
+
 ### What Is and Isn't Encrypted
 
 Encryption covers the **server-to-client SSE leg only**. Incoming webhook POST bodies arrive at the server in plaintext, as does all web UI traffic.

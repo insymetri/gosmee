@@ -40,8 +40,10 @@ func SaveKeyPair(path string, publicKey, privateKey *[32]byte) error {
 		return err
 	}
 
+	// The public key uses the same encoding as ParsePublicKey, because
+	// operators copy this field into the server's --encrypted-channels-file.
 	stored := storedKeyPair{
-		PublicKey:  base64.StdEncoding.EncodeToString(publicKey[:]),
+		PublicKey:  EncodePublicKey(publicKey),
 		PrivateKey: base64.StdEncoding.EncodeToString(privateKey[:]),
 	}
 	encoded, err := json.Marshal(stored) //nolint:gosec // intentionally marshaling key pair for storage
@@ -141,11 +143,11 @@ func loadKeyPair(data []byte) (*[32]byte, *[32]byte, error) {
 		return nil, nil, fmt.Errorf("unmarshal key file: %w", err)
 	}
 
-	publicKey, err := decodeStdKey(stored.PublicKey)
+	publicKey, err := decodeStoredKey(stored.PublicKey)
 	if err != nil {
 		return nil, nil, fmt.Errorf("decode public key: %w", err)
 	}
-	privateKey, err := decodeStdKey(stored.PrivateKey)
+	privateKey, err := decodeStoredKey(stored.PrivateKey)
 	if err != nil {
 		return nil, nil, fmt.Errorf("decode private key: %w", err)
 	}
@@ -153,7 +155,14 @@ func loadKeyPair(data []byte) (*[32]byte, *[32]byte, error) {
 	return publicKey, privateKey, nil
 }
 
-func decodeStdKey(encoded string) (*[32]byte, error) {
+// decodeStoredKey reads both encodings a key file can hold. gosmee wrote
+// standard base64 before it aligned the public key with EncodePublicKey. The
+// two alphabets and the padding make the choice unambiguous for a 32-byte key.
+func decodeStoredKey(encoded string) (*[32]byte, error) {
+	if decoded, err := base64.RawURLEncoding.DecodeString(encoded); err == nil {
+		return bytesToKey(decoded)
+	}
+
 	decoded, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
 		return nil, err

@@ -282,3 +282,45 @@ func TestClientPermanentTargetErrorDoesNotRetry(t *testing.T) {
 	assert.NilError(t, err)
 	assert.Equal(t, calls, 1)
 }
+
+func TestConsumeSSEStreamPermanentOn400(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		http.Error(w, "subtree (prefix) subscriptions are not supported when the server runs with --redis-url", http.StatusBadRequest)
+	}))
+	defer server.Close()
+
+	gs := newTestGoSmeeForProcessing(&replayDataOpts{targetURL: "http://localhost:1"})
+	err := gs.consumeSSEStream(context.Background(), server.Client(), server.URL, "test", nil, &resumeState{}, newRetryBackoff())
+	assert.Assert(t, err != nil)
+	assert.Assert(t, isPermanentClientProcessingError(err))
+	assert.ErrorContains(t, err, "--redis-url")
+	assert.Equal(t, calls, 1)
+}
+
+func TestConsumeSSEStreamRetriesOn404(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "not found", http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	gs := newTestGoSmeeForProcessing(&replayDataOpts{targetURL: "http://localhost:1"})
+	err := gs.consumeSSEStream(context.Background(), server.Client(), server.URL, "test", nil, &resumeState{}, newRetryBackoff())
+	assert.Assert(t, err != nil)
+	assert.Assert(t, !isPermanentClientProcessingError(err))
+}
+
+func TestConsumeSSEStreamRequiresPrefixAcknowledgement(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	gs := newTestGoSmeeForProcessing(&replayDataOpts{targetURL: "http://localhost:1", prefixMode: true})
+	err := gs.consumeSSEStream(context.Background(), server.Client(), server.URL, "test", nil, &resumeState{}, newRetryBackoff())
+	assert.Assert(t, err != nil)
+	assert.Assert(t, isPermanentClientProcessingError(err))
+	assert.ErrorContains(t, err, "subtree")
+}
